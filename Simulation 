@@ -1,0 +1,128 @@
+"""
+Regenerative braking simulation for a Hybrid Electric Vehicle (HEV).
+Compares: No regen | Parallel (fixed-ratio) regen | Series (SoC/speed-aware) regen
+NOTE: drive cycle is a synthetic urban stop-and-go cycle (UDDS-like). Replace
+      with real UDDS/NEDC data by loading a CSV into (t, v) below.
+"""
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import os
+
+# ---------------- Parameters ----------------
+m, Cd, A, Crr = 1500.0, 0.30, 2.2, 0.012      # kg, -, m^2, -
+rho, g, rw = 1.2, 9.81, 0.30                  # kg/m^3, m/s^2, m
+eta_drv = 0.92                                # motor+inverter+gearbox efficiency
+P_mot_max = 50e3                              # W (motor/generator rating)
+T_mot_max = 200.0                             # Nm at wheel-side equivalent limit/ratio
+gear = 8.0
+batt_kWh, V_batt = 1.8, 200.0                 # HEV battery pack
+I_chg_max = 80.0                              # A (charge current limit)
+eta_batt = 0.97
+assist_share = 0.60                           # share of traction power from motor (rest engine)
+SoC0 = 0.60
+dt = 1.0
+
+# ---------------- Drive cycle (synthetic urban) ----------------
+kmh = [0,0,25,40,40,0,0,35,55,55,30,0,0,20,45,50,0,0,30,60,60,25,0,0,
+       40,48,48,15,0,0,25,50,50,0]
+tt  = [0,8,20,35,50,62,72,85,100,115,128,138,148,160,175,190,202,212,225,
+       242,262,278,290,300,315,330,345,358,368,378,392,408,425,440]
+t = np.arange(0, tt[-1]+1, dt)
+v = np.interp(t, tt, np.array(kmh)/3.6)
+a = np.gradient(v, dt)
+
+# ---------------- Strategies ----------------
+def regen_fraction(strategy, v, soc):
+    if strategy == "none":
+        return 0.0
+    if strategy == "parallel":                 # fixed share, no speed/SoC adaptation
+        return 0.30
+    # series: max regen, fades at low speed and high SoC
+    f_speed = np.clip((v*3.6 - 8)/12, 0, 1)    # fade 8-20 km/h
+    f_soc = np.clip((0.90 - soc)/0.15, 0, 1)   # fade 75-90 % SoC
+    return 0.65 * f_speed * f_soc   # 0.65 = driven-axle brake share limit (stability)
+
+def simulate(strategy):
+    soc = SoC0
+    cap = batt_kWh*3.6e6
+    out = {k: [] for k in ["soc","Pbatt","Pregen","Pfric","Ftrac"]}
+    E_brake = E_regen = E_trac_batt = 0.0
+    for i in range(len(t)):
+        F_res = 0.5*rho*Cd*A*v[i]**2 + m*g*Crr*(v[i] > 0.1)
+        F = m*a[i] + F_res
+        P_wheel = F*v[i]
+        P_batt = P_regen = P_fric = 0.0
+        if P_wheel >= 0:
+            P_batt = assist_share*P_wheel/eta_drv/eta_batt
+            E_trac_batt += P_batt*dt
+        else:
+            # braking: only the part above resistive losses must be braked
+            P_brk = -P_wheel
+            f = regen_fraction(strategy, v[i], soc)
+            P_reg_w = min(f*P_brk, P_mot_max)
+            P_reg_elec = P_reg_w*eta_drv*eta_batt
+            P_reg_elec = min(P_reg_elec, I_chg_max*V_batt)
+            P_regen = P_reg_elec
+            P_fric = P_brk - P_reg_elec/(eta_drv*eta_batt)
+            P_batt = -P_reg_elec
+            E_brake += P_brk*dt
+            E_regen += P_reg_elec*dt
+        soc -= P_batt*dt/cap
+        soc = float(np.clip(soc, 0, 1))
+        for k, val in zip(out, [soc, P_batt, P_regen, P_fric, F]):
+            out[k].append(val)
+    res = {k: np.array(vv) for k, vv in out.items()}
+    res.update(E_brake=E_brake/3600, E_regen=E_regen/3600, E_trac=E_trac_batt/3600)
+    return res
+
+strategies = {"none": "No regen", "parallel": "Parallel regen", "series": "Series regen"}
+R = {s: simulate(s) for s in strategies}
+
+# ---------------- Results ----------------
+dist_km = np.trapezoid(v, t)/1000
+print(f"Cycle: {t[-1]:.0f} s, {dist_km:.2f} km, max {v.max()*3.6:.0f} km/h")
+print(f"{'Strategy':16s}{'Final SoC%':>11s}{'Regen Wh':>10s}{'Recovery%':>11s}{'Net Wh/km':>11s}")
+rows = []
+for s, name in strategies.items():
+    r = R[s]
+    rec = 100*r["E_regen"]/r["E_brake"]
+    net = (r["E_trac"] - r["E_regen"])/dist_km
+    rows.append((name, r["soc"][-1]*100, r["E_regen"], rec, net))
+    print(f"{name:16s}{r['soc'][-1]*100:11.2f}{r['E_regen']:10.1f}{rec:11.1f}{net:11.1f}")
+base = rows[0][4]
+for name, _, _, _, net in rows[1:]:
+    print(f"{name}: battery energy per km reduced by {100*(base-net)/base:.1f}% vs no regen")
+
+out_dir = os.path.join(os.path.dirname(__file__), "..", "results")
+cols = {"none": "#888888", "parallel": "#E69F00", "series": "#0072B2"}
+
+plt.figure(figsize=(8,3.5)); plt.plot(t, v*3.6, color="#333")
+plt.xlabel("Time (s)"); plt.ylabel("Speed (km/h)"); plt.title("Drive cycle (synthetic urban)")
+plt.grid(alpha=.3); plt.tight_layout(); plt.savefig(f"{out_dir}/speed_vs_time.png", dpi=150); plt.close()
+
+plt.figure(figsize=(8,4))
+for s, name in strategies.items():
+    plt.plot(t, R[s]["soc"]*100, label=name, color=cols[s], lw=2)
+plt.xlabel("Time (s)"); plt.ylabel("Battery SoC (%)"); plt.title("SoC vs Time")
+plt.legend(); plt.grid(alpha=.3); plt.tight_layout(); plt.savefig(f"{out_dir}/soc_vs_time.png", dpi=150); plt.close()
+
+fig, ax = plt.subplots(2, 1, figsize=(8,5), sharex=True)
+ax[0].plot(t, v*3.6, color="#333"); ax[0].set_ylabel("Speed (km/h)")
+ax[1].plot(t, R["series"]["Pregen"]/1000, color=cols["series"], label="Series regen")
+ax[1].plot(t, R["parallel"]["Pregen"]/1000, color=cols["parallel"], label="Parallel regen", alpha=.8)
+ax[1].set_ylabel("Regen power (kW)"); ax[1].set_xlabel("Time (s)"); ax[1].legend()
+for x in ax: x.grid(alpha=.3)
+plt.tight_layout(); plt.savefig(f"{out_dir}/regen_power.png", dpi=150); plt.close()
+
+names = [r[0] for r in rows[1:]]
+plt.figure(figsize=(6,4))
+b = plt.bar(names, [r[3] for r in rows[1:]], color=[cols["parallel"], cols["series"]])
+plt.bar_label(b, fmt="%.1f%%"); plt.ylabel("Braking energy recovered (%)")
+plt.title("Energy recovery comparison"); plt.tight_layout()
+plt.savefig(f"{out_dir}/energy_recovery.png", dpi=150); plt.close()
+
+with open(f"{out_dir}/results_summary.csv", "w") as f:
+    f.write("strategy,final_soc_pct,regen_Wh,recovery_pct,net_Wh_per_km\n")
+    for r in rows: f.write(f"{r[0]},{r[1]:.2f},{r[2]:.1f},{r[3]:.1f},{r[4]:.1f}\n")
